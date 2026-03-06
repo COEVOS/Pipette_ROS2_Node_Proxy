@@ -1,0 +1,11 @@
+# 吸液动作
+string sn                  # 设备 SN 号
+int32 volume               # 体积（0.01uL 单位）
+int32 speed                # 速度（1-10）
+---
+bool success               # 是否成功
+string response            # 响应内容
+string result_sn           # 设备 SN 号
+builtin_interfaces/Time result_timestamp  # 时间戳
+---
+int32 current_volume       # 当前已吸体积（反馈）

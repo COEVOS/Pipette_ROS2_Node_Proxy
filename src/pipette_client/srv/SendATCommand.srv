@@ -1,0 +1,8 @@
+# 发送 AT 命令服务
+string sn                  # 目标设备 SN 号
+string command             # AT 命令（如 "AT+ACK"）
+---
+bool success               # 是否成功
+string response            # 响应内容
+string sn                  # 设备 SN 号
+builtin_interfaces/Time timestamp  # 时间戳

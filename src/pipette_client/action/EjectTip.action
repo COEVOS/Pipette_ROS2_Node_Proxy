@@ -1,0 +1,8 @@
+# 退吸头动作
+string sn                  # 设备 SN 号
+---
+bool success               # 是否成功
+string response            # 响应内容
+string result_sn           # 设备 SN 号
+builtin_interfaces/Time result_timestamp  # 时间戳
+---

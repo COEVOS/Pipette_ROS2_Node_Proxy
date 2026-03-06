@@ -1,0 +1,7 @@
+# 获取设备列表服务
+---
+PipetteDevice[] devices    # 设备列表
+int32 count                # 设备数量
+bool success               # 是否成功
+string message             # 附加消息
+builtin_interfaces/Time timestamp  # 时间戳
