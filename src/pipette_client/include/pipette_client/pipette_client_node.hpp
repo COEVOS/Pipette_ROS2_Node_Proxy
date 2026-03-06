@@ -56,6 +56,10 @@ struct PipetteDevice
   int socket_fd;               // UDP socket
   struct sockaddr_in addr;     // 地址信息
   bool available;              // 是否可用
+  
+  // 离线检测字段
+  int miss_count;              // 连续未被发现的次数
+  bool seen_in_current_cycle;  // 在当前扫描周期中是否被发现
 };
 
 // mDNS 浏览器
@@ -96,7 +100,29 @@ private:
     uint16_t txtLen,
     const unsigned char *txtRecord,
     void *context);
+  static void DNSServiceQueryRecordReply(
+    DNSServiceRef sdRef,
+    DNSServiceFlags flags,
+    uint32_t interfaceIndex,
+    DNSServiceErrorType errorCode,
+    const char *fullname,
+    uint16_t rrtype,
+    uint16_t rrclass,
+    uint16_t rdlen,
+    const void *rdata,
+    uint32_t ttl,
+    void *context);
   void mdnsLoop();
+  
+  // ✅ mDNS 查询管理
+  struct MDNSQuery {
+    std::string sn;
+    DNSServiceRef ref;
+    rclcpp::Time query_time;
+  };
+  
+  std::vector<MDNSQuery> mdns_queries_;  // 活跃的查询列表
+  std::mutex mdns_query_mutex_;  // 查询列表互斥锁
   void parseTxtRecord(const char *txtRecord, uint16_t txtLen, 
                       const std::string &name, const std::string &host, uint16_t port);
   
@@ -113,6 +139,7 @@ private:
   PipetteDevice* getDevice(const std::string &sn);
   void updateDeviceHeartbeat(const std::string &sn);
   std::vector<std::string> getAllDeviceSNs();
+  void checkOfflineDevices();
   
   // 话题发布
   void publishDeviceList();
@@ -174,6 +201,40 @@ private:
   bool executeATCommand(const std::string &sn, const std::string &command, 
                        std::string &response, int timeout_ms = 1000);
   
+  // Test helper methods (only for testing)
+#ifdef BUILD_TESTING
+public:
+  void testAddDevice(const std::string &sn, const PipetteDevice &device) {
+    addDevice(sn, device);
+  }
+  
+  void testCheckOfflineDevices() {
+    checkOfflineDevices();
+  }
+  
+  PipetteDevice* testGetDevice(const std::string &sn) {
+    return getDevice(sn);
+  }
+  
+  std::vector<std::string> testGetAllDeviceSNs() {
+    return getAllDeviceSNs();
+  }
+  
+  void testSetOfflineThreshold(int threshold) {
+    offline_threshold_ = threshold;
+  }
+  
+  int testGetOfflineThreshold() const {
+    return offline_threshold_;
+  }
+  
+  size_t testGetDeviceCount() {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return devices_.size();
+  }
+private:
+#endif
+  
   // ROS2 组件
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<pipette_client::msg::DeviceList>::SharedPtr device_list_pub_;
@@ -205,6 +266,8 @@ private:
   // 配置参数
   std::string local_port_;      // 本地 UDP 端口
   int discovery_interval_;      // 发现间隔（秒）
+  int offline_threshold_;       // 离线判定阈值（默认 30）
+  rclcpp::Time last_scan_time_; // 上次扫描周期的时间戳
 };
 
 }  // namespace pipette_client

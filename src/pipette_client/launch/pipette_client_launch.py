@@ -19,8 +19,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'discovery_interval',
-            default_value='3',
+            default_value='10',
             description='mDNS 发现间隔（秒）'
+        ),
+        DeclareLaunchArgument(
+            'offline_threshold',
+            default_value='10',
+            description='设备离线阈值（连续未发现的次数）'
         ),
         
         # 启动节点
@@ -31,7 +36,9 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {'local_port': '10000'},
-                {'discovery_interval': '3'},
+                {'discovery_interval': 10},
+                {'offline_threshold': 3},
             ],
         ),
     ])
+    

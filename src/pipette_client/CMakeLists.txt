@@ -102,6 +102,53 @@ if(BUILD_TESTING)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+  
+  # Find GTest
+  find_package(ament_cmake_gtest REQUIRED)
+  
+  # Property-based tests for checkOfflineDevices
+  ament_add_gtest(test_check_offline_devices
+    test/test_check_offline_devices.cpp
+  )
+  target_compile_definitions(test_check_offline_devices PRIVATE BUILD_TESTING)
+  target_link_libraries(test_check_offline_devices
+    pipette_client_lib
+  )
+  target_include_directories(test_check_offline_devices PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  )
+  ament_target_dependencies(test_check_offline_devices
+    rclcpp
+    rclcpp_action
+    std_msgs
+    builtin_interfaces
+    action_msgs
+  )
+  rosidl_get_typesupport_target(cpp_typesupport_target_test
+    ${PROJECT_NAME} rosidl_typesupport_cpp)
+  target_link_libraries(test_check_offline_devices "${cpp_typesupport_target_test}")
+  
+  # Property-based tests for addDevice
+  ament_add_gtest(test_add_device
+    test/test_add_device.cpp
+  )
+  target_compile_definitions(test_add_device PRIVATE BUILD_TESTING)
+  target_link_libraries(test_add_device
+    pipette_client_lib
+  )
+  target_include_directories(test_add_device PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  )
+  ament_target_dependencies(test_add_device
+    rclcpp
+    rclcpp_action
+    std_msgs
+    builtin_interfaces
+    action_msgs
+  )
+  target_link_libraries(test_add_device "${cpp_typesupport_target_test}")
 endif()
 
 ament_export_include_directories(

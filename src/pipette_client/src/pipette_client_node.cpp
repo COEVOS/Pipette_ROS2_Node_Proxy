@@ -22,16 +22,31 @@ PipetteClientNode::PipetteClientNode(const rclcpp::NodeOptions & options)
 {
   // 声明参数
   this->declare_parameter<std::string>("local_port", "10000");
-  this->declare_parameter<std::string>("discovery_interval", "3");
+  this->declare_parameter<int>("discovery_interval", 10);
+  this->declare_parameter<int>("offline_threshold", 3);  // ✅ 改为 3 次
   
   this->get_parameter("local_port", local_port_);
-  std::string discovery_interval_str;
-  this->get_parameter("discovery_interval", discovery_interval_str);
-  discovery_interval_ = std::stoi(discovery_interval_str);
+  discovery_interval_ = this->get_parameter("discovery_interval").as_int();
+  offline_threshold_ = this->get_parameter("offline_threshold").as_int();
+  
+  // 验证 offline_threshold 参数
+  if (offline_threshold_ <= 0) {
+    RCLCPP_WARN(this->get_logger(), 
+                "Invalid offline_threshold %d, using default value 30", 
+                offline_threshold_);
+    offline_threshold_ = 30;
+  }
+  
+  // 初始化 last_scan_time_
+  last_scan_time_ = this->now();
   
   RCLCPP_INFO(this->get_logger(), "Pipette Client Node starting...");
   RCLCPP_INFO(this->get_logger(), "Local UDP Port: %s", local_port_.c_str());
   RCLCPP_INFO(this->get_logger(), "Discovery Interval: %d seconds", discovery_interval_);
+  RCLCPP_INFO(this->get_logger(), 
+              "Offline detection: threshold=%d, interval=%ds, timeout=%.1fs",
+              offline_threshold_, discovery_interval_, 
+              static_cast<double>(offline_threshold_ * discovery_interval_));
   
   // 创建发布者
   device_list_pub_ = this->create_publisher<pipette_client::msg::DeviceList>("ws/pipette/device_list", 10);
@@ -118,7 +133,7 @@ bool PipetteClientNode::startMDNSBrowser()
   
   DNSServiceErrorType err = DNSServiceBrowse(
     &mdns_browser_.ref,
-    0,
+    0,  // 接收所有服务（新添加和移除的）
     0,
     "_tcp._tcp",
     NULL,
@@ -190,7 +205,7 @@ void PipetteClientNode::DNSServiceBrowseReply(
   }
   
   if (flags & kDNSServiceFlagsAdd) {
-    RCLCPP_INFO(node->get_logger(), "Found COEVOS service: %s", serviceName);
+    RCLCPP_INFO(node->get_logger(), "[mDNS SCAN] ➕ Found new service: %s", serviceName);
     
     DNSServiceRef resolve_ref = nullptr;
     DNSServiceErrorType resolve_err = DNSServiceResolve(
@@ -205,13 +220,14 @@ void PipetteClientNode::DNSServiceBrowseReply(
     );
     
     if (resolve_err != kDNSServiceErr_NoError) {
-      RCLCPP_WARN(node->get_logger(), "DNSServiceResolve failed for %s: %d", serviceName, resolve_err);
+      RCLCPP_WARN(node->get_logger(), "[mDNS SCAN] ⚠️ DNSServiceResolve failed for %s: %d", serviceName, resolve_err);
     } else if (resolve_ref) {
       std::lock_guard<std::mutex> lock(node->devices_mutex_);
       node->mdns_browser_.resolve_refs.push_back(resolve_ref);
+      RCLCPP_DEBUG(node->get_logger(), "[mDNS SCAN] Added resolve_ref for %s", serviceName);
     }
   } else {
-    RCLCPP_INFO(node->get_logger(), "Service removed: %s", serviceName);
+    RCLCPP_INFO(node->get_logger(), "[mDNS SCAN] ➖ Service removed: %s", serviceName);
   }
 }
 
@@ -234,14 +250,99 @@ void PipetteClientNode::DNSServiceResolveReply(
   auto node = static_cast<PipetteClientNode*>(context);
   
   if (errorCode != kDNSServiceErr_NoError) {
-    RCLCPP_DEBUG(node->get_logger(), "mDNS resolve error: %d", errorCode);
+    RCLCPP_DEBUG(node->get_logger(), "[mDNS SCAN] ❌ Resolve error: %d", errorCode);
     return;
   }
   
-  RCLCPP_INFO(node->get_logger(), "Resolved service: %s -> %s:%d, txtLen=%d", 
+  RCLCPP_INFO(node->get_logger(), "[mDNS SCAN] ✅ Resolved: %s -> %s:%d, txtLen=%d", 
               fullname, hosttarget, ntohs(port), txtLen);
   
   node->parseTxtRecord(reinterpret_cast<const char*>(txtRecord), txtLen, fullname, hosttarget, ntohs(port));
+}
+
+void PipetteClientNode::DNSServiceQueryRecordReply(
+  DNSServiceRef sdRef,
+  DNSServiceFlags flags,
+  uint32_t interfaceIndex,
+  DNSServiceErrorType errorCode,
+  const char *fullname,
+  uint16_t rrtype,
+  uint16_t rrclass,
+  uint16_t rdlen,
+  const void *rdata,
+  uint32_t ttl,
+  void *context)
+{
+  (void)sdRef;
+  (void)interfaceIndex;
+  (void)rrtype;
+  (void)rrclass;
+  (void)rdlen;
+  (void)rdata;
+  
+  auto node = static_cast<PipetteClientNode*>(context);
+  
+  if (errorCode != kDNSServiceErr_NoError) {
+    // 查询失败，可能是设备离线了
+    RCLCPP_DEBUG(node->get_logger(), "[mDNS QUERY] ❌ Query failed for %s: %d", fullname, errorCode);
+    return;
+  }
+  
+  // ✅ 关键修复：检查 flags，判断是否是缓存记录
+  // kDNSServiceFlagsAdd 表示这是添加记录（正常响应）
+  // kDNSServiceFlagsUnique 表示这是唯一记录（来自设备本身）
+  // 如果没有这些 flags，可能是缓存的旧记录
+  bool is_add = (flags & kDNSServiceFlagsAdd) != 0;
+  bool is_unique = (flags & kDNSServiceFlagsUnique) != 0;
+  
+  // ✅ 检查 TTL，判断是否是缓存记录
+  // TTL=0 表示记录已过期，不应该信任
+  // TTL>0 且是新响应，可以更新 last_seen
+  if (ttl == 0) {
+    RCLCPP_DEBUG(node->get_logger(), 
+                 "[mDNS QUERY] ⚠️ Received expired record for %s (ttl=0), ignoring", 
+                 fullname);
+    return;
+  }
+  
+  // ✅ 如果是缓存记录（没有 Add 或 Unique 标志），忽略它
+  if (!is_add && !is_unique) {
+    RCLCPP_DEBUG(node->get_logger(), 
+                 "[mDNS QUERY] ⚠️ Received cached record for %s (flags=0x%x, ttl=%d), ignoring", 
+                 fullname, flags, ttl);
+    return;
+  }
+  
+  RCLCPP_INFO(node->get_logger(), 
+              "[mDNS QUERY] ✅ Received live response for %s (flags=0x%x, ttl=%d)", 
+              fullname, flags, ttl);
+  
+  // 从 fullname 中提取 SN（格式：SN._tcp._tcp.local.）
+  std::string fqdn(fullname);
+  size_t pos = fqdn.find("._tcp._tcp");
+  std::string sn;
+  if (pos != std::string::npos) {
+    sn = fqdn.substr(0, pos);
+  }
+  
+  if (!sn.empty()) {
+    // 更新设备的 last_seen 时间戳
+    auto now = node->now();
+    auto device = node->getDevice(sn);
+    if (device) {
+      device->last_seen.sec = now.seconds();
+      device->last_seen.nanosec = now.nanoseconds();
+      device->miss_count = 0;  // 重置缺失计数
+      RCLCPP_DEBUG(node->get_logger(), 
+                   "[mDNS QUERY] ✓ Updated last_seen for device %s", sn.c_str());
+    } else {
+      RCLCPP_DEBUG(node->get_logger(), 
+                   "[mDNS QUERY] ⚠️ Device %s not found in devices map", sn.c_str());
+    }
+  } else {
+    RCLCPP_WARN(node->get_logger(), 
+                "[mDNS QUERY] ⚠️ Failed to extract SN from %s", fullname);
+  }
 }
 
 void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen, 
@@ -252,6 +353,8 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
   const unsigned char *end = ptr + txtLen;
   
   std::string ip_address;
+  
+  RCLCPP_INFO(get_logger(), "[mDNS SCAN] 🔍 Parsing TXT record for host: %s", host.c_str());
   
   // 尝试将主机名解析为 IPv4 地址
   struct addrinfo hints, *res;
@@ -265,10 +368,10 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
     inet_ntop(AF_INET, &(addr->sin_addr), ip_str, INET_ADDRSTRLEN);
     ip_address = std::string(ip_str);
     freeaddrinfo(res);
-    RCLCPP_DEBUG(get_logger(), "Resolved %s to %s", host.c_str(), ip_address.c_str());
+    RCLCPP_INFO(get_logger(), "[mDNS SCAN] 🌐 Resolved IP: %s -> %s", host.c_str(), ip_address.c_str());
   } else {
     ip_address = host;
-    RCLCPP_WARN(get_logger(), "Failed to resolve %s, using hostname as-is", host.c_str());
+    RCLCPP_WARN(get_logger(), "[mDNS SCAN] ⚠️ Failed to resolve %s, using hostname as-is", host.c_str());
   }
   
   std::string sn;
@@ -289,30 +392,33 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
       
       if (key == "sn") {
         sn = value;
+        RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📝 Found SN: %s", sn.c_str());
       } else if (key == "model") {
         model = value;
+        RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📝 Found Model: %s", model.c_str());
       } else if (key == "product") {
         product = value;
+        RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📝 Found Product: %s", product.c_str());
       }
     }
   }
   
-  RCLCPP_INFO(get_logger(), "TXT parsing: sn='%s', product='%s', model='%s'", 
+  RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📋 TXT parsing result: sn='%s', product='%s', model='%s'", 
               sn.c_str(), product.c_str(), model.c_str());
   
   // 过滤：必须包含 sn 且 product 必须是 "pippet"
   if (sn.empty()) {
-    RCLCPP_WARN(get_logger(), "No SN found in TXT record, skipping device");
+    RCLCPP_WARN(get_logger(), "[mDNS SCAN] ❌ No SN found in TXT record, skipping device");
     return;
   }
   
   if (product != "pippet") {
-    RCLCPP_INFO(get_logger(), "Device product '%s' is not 'pippet', skipping (SN: %s)", 
+    RCLCPP_INFO(get_logger(), "[mDNS SCAN] ❌ Device product '%s' is not 'pippet', skipping (SN: %s)", 
                 product.c_str(), sn.c_str());
     return;
   }
   
-  RCLCPP_INFO(get_logger(), "Valid COEVOS pipette found: SN=%s, Model=%s", 
+  RCLCPP_INFO(get_logger(), "[mDNS SCAN] ✅ Valid COEVOS pipette found: SN=%s, Model=%s", 
               sn.c_str(), model.c_str());
   
   PipetteDevice device;
@@ -335,13 +441,17 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
   
   addDevice(sn, device);
   
-  RCLCPP_INFO(get_logger(), "Device added: %s (%s) at %s:%d", 
+  RCLCPP_INFO(get_logger(), "[mDNS SCAN] 🎉 Device added: %s (%s) at %s:%d", 
               sn.c_str(), model.c_str(), ip_address.c_str(), device.port);
 }
 
 void PipetteClientNode::mdnsLoop()
 {
   RCLCPP_INFO(this->get_logger(), "mDNS event loop started");
+  
+  // 初始化 last_scan_time_ 为当前时间
+  last_scan_time_ = this->now();
+  auto cycle_start_time = last_scan_time_;  // 记录每个扫描周期的开始时间
   
   while (mdns_browser_.running && rclcpp::ok()) {
     fd_set readfds;
@@ -361,6 +471,20 @@ void PipetteClientNode::mdnsLoop()
         if (fd >= 0) {
           FD_SET(fd, &readfds);
           active_resolve_refs.push_back(resolve_ref);
+          if (fd > max_fd) max_fd = fd;
+        }
+      }
+    }
+    
+    // ✅ 加入 QueryRecord 查询的 sockets
+    std::vector<DNSServiceRef> active_query_refs;
+    {
+      std::lock_guard<std::mutex> lock(mdns_query_mutex_);
+      for (auto &query : mdns_queries_) {
+        int fd = DNSServiceRefSockFD(query.ref);
+        if (fd >= 0) {
+          FD_SET(fd, &readfds);
+          active_query_refs.push_back(query.ref);
           if (fd > max_fd) max_fd = fd;
         }
       }
@@ -396,6 +520,157 @@ void PipetteClientNode::mdnsLoop()
           }
         }
       }
+      
+      // ✅ 处理 QueryRecord 查询的响应
+      for (size_t i = 0; i < active_query_refs.size(); ++i) {
+        int fd = DNSServiceRefSockFD(active_query_refs[i]);
+        if (fd >= 0 && FD_ISSET(fd, &readfds)) {
+          DNSServiceErrorType err = DNSServiceProcessResult(active_query_refs[i]);
+          if (err != kDNSServiceErr_NoError && err != kDNSServiceErr_NoSuchRecord) {
+            RCLCPP_DEBUG(this->get_logger(), "Query DNSServiceProcessResult: %d", err);
+          }
+        }
+      }
+    }
+    
+    // 检查是否到达扫描周期结束时间
+    auto current_time = this->now();
+    auto elapsed = (current_time - cycle_start_time).seconds();
+    
+    // 添加调试日志，每次循环都输出经过的时间
+    static int loop_count = 0;
+    loop_count++;
+    if (loop_count % 10 == 0) {  // 每 10 次循环输出一次
+      RCLCPP_DEBUG(this->get_logger(), 
+                   "mdnsLoop: elapsed=%.2fs, discovery_interval=%d", 
+                   elapsed, discovery_interval_);
+    }
+    
+    // 时间异常处理
+    if (elapsed < 0 || elapsed > 2 * discovery_interval_) {
+      RCLCPP_WARN(this->get_logger(), 
+                  "Abnormal elapsed time: %.2fs, resetting scan timer", 
+                  elapsed);
+      cycle_start_time = current_time;
+    } else if (elapsed >= discovery_interval_) {
+      // 扫描周期结束，执行离线检测
+      RCLCPP_INFO(this->get_logger(), 
+                  "Scan cycle completed: elapsed=%.2fs, calling checkOfflineDevices()", 
+                  elapsed);
+      
+      // ✅ 重新发起 Browse 请求来发现新设备
+      RCLCPP_INFO(this->get_logger(), "Re-browsing _tcp._tcp.local for periodic scan...");
+      
+      // 清理旧的 resolve refs
+      {
+        std::lock_guard<std::mutex> lock(devices_mutex_);
+        for (DNSServiceRef resolve_ref : mdns_browser_.resolve_refs) {
+          if (resolve_ref) {
+            DNSServiceRefDeallocate(resolve_ref);
+          }
+        }
+        mdns_browser_.resolve_refs.clear();
+      }
+      
+      // 释放旧的 browse ref
+      if (mdns_browser_.ref) {
+        DNSServiceRefDeallocate(mdns_browser_.ref);
+        mdns_browser_.ref = nullptr;
+      }
+      
+      // 重新发起 Browse 请求
+      DNSServiceErrorType browse_err = DNSServiceBrowse(
+        &mdns_browser_.ref,
+        0,
+        0,
+        "_tcp._tcp",
+        NULL,
+        DNSServiceBrowseReply,
+        this
+      );
+      
+      if (browse_err != kDNSServiceErr_NoError) {
+        RCLCPP_DEBUG(this->get_logger(), "Periodic browse failed: %d", browse_err);
+      } else if (!mdns_browser_.ref) {
+        RCLCPP_ERROR(this->get_logger(), "Re-browse returned null ref");
+      } else {
+        RCLCPP_INFO(this->get_logger(), "Successfully re-browsed, waiting for responses...");
+      }
+      
+      // ✅ 对已知设备发送 QueryRecord 查询（异步模式）
+      // DNS-SD 官方推荐：创建查询后，将 ref 加入 select 监听，在事件循环中处理响应
+      {
+        std::lock_guard<std::mutex> lock(mdns_query_mutex_);
+        auto now = this->now();
+        
+        // 先清理超过 15 秒的旧查询
+        auto it = mdns_queries_.begin();
+        while (it != mdns_queries_.end()) {
+          auto elapsed_time = (now - it->query_time).seconds();
+          if (elapsed_time > 15) {
+            RCLCPP_DEBUG(this->get_logger(), 
+                         "Removing expired query for %s (%.2fs old)", 
+                         it->sn.c_str(), elapsed_time);
+            if (it->ref) {
+              DNSServiceRefDeallocate(it->ref);
+            }
+            it = mdns_queries_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        
+        // 只对 miss_count >= 2 的设备发送查询（给新设备 2 个周期的宽限期）
+        int query_count = 0;
+        for (auto &pair : devices_) {
+          auto &device = pair.second;
+          if (device.miss_count >= 2) {
+            DNSServiceRef query_ref = nullptr;
+            std::string fqdn = device.sn + "._tcp._tcp.local.";
+            DNSServiceErrorType query_err = DNSServiceQueryRecord(
+              &query_ref,
+              0,
+              0,
+              fqdn.c_str(),
+              kDNSServiceType_SRV,
+              kDNSServiceClass_IN,
+              DNSServiceQueryRecordReply,
+              this
+            );
+            
+            if (query_err == kDNSServiceErr_NoError && query_ref) {
+              // 将查询加入列表，稍后在 select 中监听
+              MDNSQuery query;
+              query.sn = device.sn;
+              query.ref = query_ref;
+              query.query_time = now;
+              mdns_queries_.push_back(query);
+              query_count++;
+              
+              RCLCPP_DEBUG(this->get_logger(), 
+                           "Started QueryRecord for %s (miss_count=%d)", 
+                           device.sn.c_str(), device.miss_count);
+            } else {
+              RCLCPP_DEBUG(this->get_logger(), 
+                           "Failed to send QueryRecord for %s: %d", 
+                           device.sn.c_str(), query_err);
+            }
+          }
+        }
+        
+        RCLCPP_INFO(this->get_logger(), 
+                    "Sent %d QueryRecord queries, active queries: %zu", 
+                    query_count, mdns_queries_.size());
+        
+        // 增加 miss_count
+        for (auto &pair : devices_) {
+          auto &device = pair.second;
+          device.miss_count++;
+        }
+      }
+      
+      checkOfflineDevices();
+      cycle_start_time = current_time;
     }
   }
   
@@ -561,14 +836,27 @@ void PipetteClientNode::addDevice(const std::string &sn, const PipetteDevice &de
   
   auto it = devices_.find(sn);
   if (it != devices_.end()) {
+    // 设备已存在，更新状态
     it->second.last_seen = device.last_seen;
+    it->second.miss_count = 0;  // 重置缺失计数
+    it->second.seen_in_current_cycle = true;  // 标记为本周期已发现
+    
     if (!it->second.available) {
       it->second.available = true;
-      RCLCPP_INFO(this->get_logger(), "Device reactivated: %s", sn.c_str());
+      RCLCPP_INFO(this->get_logger(), "Device %s (%s) back online", 
+                  sn.c_str(), it->second.ip_address.c_str());
     }
-    RCLCPP_DEBUG(this->get_logger(), "Device refreshed: %s", sn.c_str());
+    
+    RCLCPP_DEBUG(this->get_logger(), "Device %s refreshed, miss_count reset to 0", 
+                 sn.c_str());
   } else {
-    devices_[sn] = device;
+    // 新设备，初始化离线检测字段
+    PipetteDevice new_device = device;
+    new_device.miss_count = 0;
+    new_device.seen_in_current_cycle = true;
+    
+    devices_[sn] = new_device;
+    
     RCLCPP_INFO(this->get_logger(), "New device discovered: %s (%s) at %s:%d", 
                 sn.c_str(), device.model.c_str(), device.ip_address.c_str(), device.port);
   }
@@ -619,6 +907,66 @@ std::vector<std::string> PipetteClientNode::getAllDeviceSNs()
     }
   }
   return sns;
+}
+
+void PipetteClientNode::checkOfflineDevices()
+{
+  std::lock_guard<std::mutex> lock(devices_mutex_);
+  
+  RCLCPP_INFO(this->get_logger(), 
+              "checkOfflineDevices() called, total devices: %zu", 
+              devices_.size());
+  
+  std::vector<std::string> devices_to_remove;
+  
+  // 遍历所有设备，基于连续未响应次数判断是否离线
+  for (auto &pair : devices_) {
+    auto &device = pair.second;
+    
+    // ✅ 关键修复：使用连续未响应次数，而不是累加的时间间隔
+    // miss_count 在 DNSServiceQueryRecordReply 中收到响应时重置为 0
+    // 在每个扫描周期，如果没有收到响应，miss_count 会增加
+    RCLCPP_DEBUG(this->get_logger(), 
+                 "Device %s: miss_count=%d/%d", 
+                 device.sn.c_str(), device.miss_count, offline_threshold_);
+    
+    // 如果连续未响应次数超过阈值，判定为离线
+    if (device.miss_count >= offline_threshold_) {
+      RCLCPP_WARN(this->get_logger(), 
+                  "Device %s (%s) offline after %d consecutive missed responses", 
+                  device.sn.c_str(), device.ip_address.c_str(), 
+                  device.miss_count);
+      devices_to_remove.push_back(pair.first);
+    }
+  }
+  
+  RCLCPP_INFO(this->get_logger(), 
+              "Scan summary: to_remove=%zu", 
+              devices_to_remove.size());
+  
+  // 移除离线设备
+  for (const auto &sn : devices_to_remove) {
+    auto it = devices_.find(sn);
+    if (it != devices_.end()) {
+      // 关闭 socket（如果是独立的 socket）
+      if (it->second.socket_fd >= 0 && it->second.socket_fd != udp_socket_) {
+        if (close(it->second.socket_fd) < 0) {
+          RCLCPP_DEBUG(this->get_logger(), 
+                       "Failed to close socket for device %s: %s", 
+                       it->second.sn.c_str(), strerror(errno));
+        }
+      }
+      devices_.erase(it);
+    }
+  }
+  
+  // 如果有设备被移除，发布更新的设备列表
+  if (!devices_to_remove.empty()) {
+    // 注意：publishDeviceList() 会尝试获取 devices_mutex_，
+    // 但我们已经持有锁，所以需要在释放锁后调用
+    // 为了避免死锁，我们在这里不调用 publishDeviceList()
+    // 而是依赖定时器定期发布设备列表
+  }
 }
 
 // ==================== 话题发布 ====================
