@@ -605,11 +605,11 @@ ros2 service call /ws/pipette/service/send_at_command pipette_client/srv/SendATC
 
 ## 👥 维护者
 
-- franco <djc.bj2012@gmail.com>
+- franco <djc.bj2012@gmail.com> <jingchao.dai@coevos.com>
 
 ## 🙏 致谢
 
 ---
 
-**最后更新**: 2026-03-05  
-**版本**: 0.0.1
+**最后更新**: 2026-03-16  
+**版本**: 0.2.1

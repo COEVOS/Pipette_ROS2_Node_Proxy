@@ -15,19 +15,11 @@ find_package(builtin_interfaces REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
-# Find Avahi library using Apple Bonjour compatibility layer
+# Find Avahi library (native API)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(AVAHI REQUIRED avahi-compat-libdns_sd)
+pkg_check_modules(AVAHI_CLIENT REQUIRED avahi-client)
 
-if(NOT AVAHI_FOUND)
-  find_library(AVAHI_COMPAT_LIB avahi-compat-libdns_sd)
-  if(NOT AVAHI_COMPAT_LIB)
-    message(FATAL_ERROR "Avahi compat library not found. Install with: sudo apt-get install libavahi-compat-libdnssd-dev")
-  endif()
-  set(AVAHI_LIB ${AVAHI_COMPAT_LIB})
-else()
-  set(AVAHI_LIB ${AVAHI_LIBRARIES})
-endif()
+# avahi-common is included with avahi-client, no separate check needed
 
 # Generate custom interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -50,7 +42,8 @@ target_compile_features(pipette_client_lib PUBLIC c_std_99 cxx_std_17)
 target_include_directories(pipette_client_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(pipette_client_lib ${AVAHI_LIB})
+target_link_libraries(pipette_client_lib 
+  ${AVAHI_CLIENT_LIBRARIES})
 ament_target_dependencies(
   pipette_client_lib
   "rclcpp"

@@ -6,6 +6,9 @@
 #include <regex>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <iomanip>
+#include <poll.h>
+#include <vector>
 
 namespace pipette_client
 {
@@ -32,9 +35,9 @@ PipetteClientNode::PipetteClientNode(const rclcpp::NodeOptions & options)
   // 验证 offline_threshold 参数
   if (offline_threshold_ <= 0) {
     RCLCPP_WARN(this->get_logger(), 
-                "Invalid offline_threshold %d, using default value 30", 
+                "Invalid offline_threshold %d, using default value 3", 
                 offline_threshold_);
-    offline_threshold_ = 30;
+    offline_threshold_ = 3;
   }
   
   // 初始化 last_scan_time_
@@ -129,30 +132,46 @@ bool PipetteClientNode::startMDNSBrowser()
   RCLCPP_INFO(this->get_logger(), "Starting mDNS browser for _tcp._tcp.local (COEVOS devices)");
   
   mdns_browser_.running = true;
-  mdns_browser_.ref = nullptr;
+  mdns_browser_.client = nullptr;
+  mdns_browser_.service_browser = nullptr;
+  mdns_browser_.simple_poll = nullptr;
   
-  DNSServiceErrorType err = DNSServiceBrowse(
-    &mdns_browser_.ref,
-    0,  // 接收所有服务（新添加和移除的）
-    0,
-    "_tcp._tcp",
-    NULL,
-    DNSServiceBrowseReply,
+  // 创建 Avahi simple poll
+  mdns_browser_.simple_poll = avahi_simple_poll_new();
+  if (!mdns_browser_.simple_poll) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to create Avahi simple poll");
+    return false;
+  }
+  
+  // 创建 Avahi client
+  int err;
+  mdns_browser_.client = avahi_client_new(avahi_simple_poll_get(mdns_browser_.simple_poll), 
+                                           static_cast<AvahiClientFlags>(0), 
+                                           nullptr, nullptr, &err);
+  if (!mdns_browser_.client) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to create Avahi client: %s", avahi_strerror(err));
+    return false;
+  }
+  
+  // 创建服务浏览器
+  mdns_browser_.service_browser = avahi_service_browser_new(
+    mdns_browser_.client,
+    AVAHI_IF_UNSPEC,      // 所有接口
+    AVAHI_PROTO_UNSPEC,   // 所有协议
+    "_tcp._tcp",          // 服务类型
+    NULL,                 // 域
+    static_cast<AvahiLookupFlags>(0),
+    serviceBrowserCallback,
     this
   );
   
-  if (err != kDNSServiceErr_NoError) {
-    RCLCPP_ERROR(this->get_logger(), "mDNS browse failed: %d", err);
+  if (!mdns_browser_.service_browser) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to create Avahi service browser: %s", 
+                 avahi_strerror(avahi_client_errno(mdns_browser_.client)));
     return false;
   }
   
-  if (!mdns_browser_.ref) {
-    RCLCPP_ERROR(this->get_logger(), "mDNS ref is null after DNSServiceBrowse");
-    return false;
-  }
-  
-  int fd = DNSServiceRefSockFD(mdns_browser_.ref);
-  RCLCPP_INFO(this->get_logger(), "mDNS socket fd: %d", fd);
+  RCLCPP_INFO(this->get_logger(), "Avahi service browser created successfully");
   
   mdns_thread_ = std::thread(&PipetteClientNode::mdnsLoop, this);
   
@@ -163,17 +182,31 @@ void PipetteClientNode::stopMDNSBrowser()
 {
   mdns_browser_.running = false;
   
-  if (mdns_browser_.ref) {
-    DNSServiceRefDeallocate(mdns_browser_.ref);
-    mdns_browser_.ref = nullptr;
-  }
-  
-  for (DNSServiceRef resolve_ref : mdns_browser_.resolve_refs) {
-    if (resolve_ref) {
-      DNSServiceRefDeallocate(resolve_ref);
+  // 停止所有活跃的解析器
+  for (auto& pair : mdns_browser_.active_resolvers) {
+    if (pair.second) {
+      avahi_service_resolver_free(pair.second);
     }
   }
-  mdns_browser_.resolve_refs.clear();
+  mdns_browser_.active_resolvers.clear();
+  
+  // 停止服务浏览器
+  if (mdns_browser_.service_browser) {
+    avahi_service_browser_free(mdns_browser_.service_browser);
+    mdns_browser_.service_browser = nullptr;
+  }
+  
+  // 释放 Avahi client
+  if (mdns_browser_.client) {
+    avahi_client_free(mdns_browser_.client);
+    mdns_browser_.client = nullptr;
+  }
+  
+  // 释放 simple poll
+  if (mdns_browser_.simple_poll) {
+    avahi_simple_poll_free(mdns_browser_.simple_poll);
+    mdns_browser_.simple_poll = nullptr;
+  }
   
   if (mdns_thread_.joinable()) {
     mdns_thread_.join();
@@ -182,167 +215,128 @@ void PipetteClientNode::stopMDNSBrowser()
   RCLCPP_INFO(this->get_logger(), "mDNS browser stopped");
 }
 
-void PipetteClientNode::DNSServiceBrowseReply(
-  DNSServiceRef sdRef,
-  DNSServiceFlags flags,
-  uint32_t interfaceIndex,
-  DNSServiceErrorType errorCode,
-  const char *serviceName,
-  const char *regtype,
-  const char *replyDomain,
-  void *context)
+void PipetteClientNode::serviceBrowserCallback(
+  AvahiServiceBrowser *b,
+  AvahiIfIndex interface,
+  AvahiProtocol protocol,
+  AvahiBrowserEvent event,
+  const char *name,
+  const char *type,
+  const char *domain,
+  AvahiLookupResultFlags flags,
+  void *userdata)
 {
-  (void)sdRef;
-  (void)interfaceIndex;
-  (void)regtype;
-  (void)replyDomain;
+  (void)b;
+  (void)interface;
+  (void)protocol;
   
-  auto node = static_cast<PipetteClientNode*>(context);
+  auto node = static_cast<PipetteClientNode*>(userdata);
   
-  if (errorCode != kDNSServiceErr_NoError) {
-    RCLCPP_ERROR(node->get_logger(), "mDNS browse error: %d", errorCode);
-    return;
-  }
-  
-  if (flags & kDNSServiceFlagsAdd) {
-    RCLCPP_INFO(node->get_logger(), "[mDNS SCAN] ➕ Found new service: %s", serviceName);
-    
-    DNSServiceRef resolve_ref = nullptr;
-    DNSServiceErrorType resolve_err = DNSServiceResolve(
-      &resolve_ref,
-      0,
-      0,
-      serviceName,
-      regtype,
-      replyDomain,
-      DNSServiceResolveReply,
-      context
-    );
-    
-    if (resolve_err != kDNSServiceErr_NoError) {
-      RCLCPP_WARN(node->get_logger(), "[mDNS SCAN] ⚠️ DNSServiceResolve failed for %s: %d", serviceName, resolve_err);
-    } else if (resolve_ref) {
-      std::lock_guard<std::mutex> lock(node->devices_mutex_);
-      node->mdns_browser_.resolve_refs.push_back(resolve_ref);
-      RCLCPP_DEBUG(node->get_logger(), "[mDNS SCAN] Added resolve_ref for %s", serviceName);
+  switch (event) {
+    case AVAHI_BROWSER_NEW: {
+      RCLCPP_INFO(node->get_logger(), "[mDNS BROWSE] ➕ Found service: %s (type: %s, domain: %s)", 
+                  name, type, domain);
+      
+      // 创建服务解析器
+      AvahiServiceResolver* resolver = avahi_service_resolver_new(
+        node->mdns_browser_.client,
+        AVAHI_IF_UNSPEC,           // 所有接口
+        AVAHI_PROTO_UNSPEC,        // 所有协议
+        name,                      // 服务名称
+        type,                      // 服务类型
+        domain,                    // 域
+        AVAHI_PROTO_INET,          // IPv4
+        static_cast<AvahiLookupFlags>(0),
+        serviceResolverCallback,
+        node
+      );
+      
+      if (resolver) {
+        std::lock_guard<std::mutex> lock(node->devices_mutex_);
+        node->mdns_browser_.active_resolvers[name] = resolver;
+        RCLCPP_INFO(node->get_logger(), 
+                    "[mDNS BROWSE] ✅ Started resolving %s", name);
+      } else {
+        RCLCPP_WARN(node->get_logger(), 
+                    "[mDNS BROWSE] ⚠️ Failed to create resolver for %s: %s",
+                    name, avahi_strerror(avahi_client_errno(node->mdns_browser_.client)));
+      }
+      break;
     }
-  } else {
-    RCLCPP_INFO(node->get_logger(), "[mDNS SCAN] ➖ Service removed: %s", serviceName);
+    case AVAHI_BROWSER_REMOVE: {
+      RCLCPP_INFO(node->get_logger(), "[mDNS BROWSE] ➖ Service removed: %s (type: %s, domain: %s)", 
+                  name, type, domain);
+      break;
+    }
+    case AVAHI_BROWSER_FAILURE: {
+      RCLCPP_ERROR(node->get_logger(), "[mDNS BROWSE] ❌ Browser failure: %s", 
+                   avahi_strerror(avahi_client_errno(node->mdns_browser_.client)));
+      break;
+    }
+    case AVAHI_BROWSER_ALL_FOR_NOW: {
+      RCLCPP_DEBUG(node->get_logger(), "[mDNS BROWSE] ✓ All services enumerated");
+      break;
+    }
+    case AVAHI_BROWSER_CACHE_EXHAUSTED: {
+      RCLCPP_DEBUG(node->get_logger(), "[mDNS BROWSE] Cache exhausted");
+      break;
+    }
   }
 }
 
-void PipetteClientNode::DNSServiceResolveReply(
-  DNSServiceRef sdRef,
-  DNSServiceFlags flags,
-  uint32_t interfaceIndex,
-  DNSServiceErrorType errorCode,
-  const char *fullname,
-  const char *hosttarget,
+void PipetteClientNode::serviceResolverCallback(
+  AvahiServiceResolver *r,
+  AvahiIfIndex interface,
+  AvahiProtocol protocol,
+  AvahiResolverEvent event,
+  const char *name,
+  const char *type,
+  const char *domain,
+  const char *host_name,
+  const AvahiAddress *address,
   uint16_t port,
-  uint16_t txtLen,
-  const unsigned char *txtRecord,
-  void *context)
+  AvahiStringList *txt,
+  AvahiLookupResultFlags result_flags,
+  void *userdata)
 {
-  (void)sdRef;
-  (void)flags;
-  (void)interfaceIndex;
+  (void)r;
+  (void)interface;
+  (void)protocol;
+  (void)type;
+  (void)domain;
+  (void)result_flags;
   
-  auto node = static_cast<PipetteClientNode*>(context);
+  auto node = static_cast<PipetteClientNode*>(userdata);
   
-  if (errorCode != kDNSServiceErr_NoError) {
-    RCLCPP_DEBUG(node->get_logger(), "[mDNS SCAN] ❌ Resolve error: %d", errorCode);
-    return;
-  }
-  
-  RCLCPP_INFO(node->get_logger(), "[mDNS SCAN] ✅ Resolved: %s -> %s:%d, txtLen=%d", 
-              fullname, hosttarget, ntohs(port), txtLen);
-  
-  node->parseTxtRecord(reinterpret_cast<const char*>(txtRecord), txtLen, fullname, hosttarget, ntohs(port));
-}
-
-void PipetteClientNode::DNSServiceQueryRecordReply(
-  DNSServiceRef sdRef,
-  DNSServiceFlags flags,
-  uint32_t interfaceIndex,
-  DNSServiceErrorType errorCode,
-  const char *fullname,
-  uint16_t rrtype,
-  uint16_t rrclass,
-  uint16_t rdlen,
-  const void *rdata,
-  uint32_t ttl,
-  void *context)
-{
-  (void)sdRef;
-  (void)interfaceIndex;
-  (void)rrtype;
-  (void)rrclass;
-  (void)rdlen;
-  (void)rdata;
-  
-  auto node = static_cast<PipetteClientNode*>(context);
-  
-  if (errorCode != kDNSServiceErr_NoError) {
-    // 查询失败，可能是设备离线了
-    RCLCPP_DEBUG(node->get_logger(), "[mDNS QUERY] ❌ Query failed for %s: %d", fullname, errorCode);
-    return;
-  }
-  
-  // ✅ 关键修复：检查 flags，判断是否是缓存记录
-  // kDNSServiceFlagsAdd 表示这是添加记录（正常响应）
-  // kDNSServiceFlagsUnique 表示这是唯一记录（来自设备本身）
-  // 如果没有这些 flags，可能是缓存的旧记录
-  bool is_add = (flags & kDNSServiceFlagsAdd) != 0;
-  bool is_unique = (flags & kDNSServiceFlagsUnique) != 0;
-  
-  // ✅ 检查 TTL，判断是否是缓存记录
-  // TTL=0 表示记录已过期，不应该信任
-  // TTL>0 且是新响应，可以更新 last_seen
-  if (ttl == 0) {
-    RCLCPP_DEBUG(node->get_logger(), 
-                 "[mDNS QUERY] ⚠️ Received expired record for %s (ttl=0), ignoring", 
-                 fullname);
-    return;
-  }
-  
-  // ✅ 如果是缓存记录（没有 Add 或 Unique 标志），忽略它
-  if (!is_add && !is_unique) {
-    RCLCPP_DEBUG(node->get_logger(), 
-                 "[mDNS QUERY] ⚠️ Received cached record for %s (flags=0x%x, ttl=%d), ignoring", 
-                 fullname, flags, ttl);
-    return;
-  }
-  
-  RCLCPP_INFO(node->get_logger(), 
-              "[mDNS QUERY] ✅ Received live response for %s (flags=0x%x, ttl=%d)", 
-              fullname, flags, ttl);
-  
-  // 从 fullname 中提取 SN（格式：SN._tcp._tcp.local.）
-  std::string fqdn(fullname);
-  size_t pos = fqdn.find("._tcp._tcp");
-  std::string sn;
-  if (pos != std::string::npos) {
-    sn = fqdn.substr(0, pos);
-  }
-  
-  if (!sn.empty()) {
-    // 更新设备的 last_seen 时间戳
-    auto now = node->now();
-    auto device = node->getDevice(sn);
-    if (device) {
-      device->last_seen.sec = now.seconds();
-      device->last_seen.nanosec = now.nanoseconds();
-      device->miss_count = 0;  // 重置缺失计数
-      RCLCPP_DEBUG(node->get_logger(), 
-                   "[mDNS QUERY] ✓ Updated last_seen for device %s", sn.c_str());
-    } else {
-      RCLCPP_DEBUG(node->get_logger(), 
-                   "[mDNS QUERY] ⚠️ Device %s not found in devices map", sn.c_str());
+  // 从 active_resolvers 中移除
+  {
+    std::lock_guard<std::mutex> lock(node->devices_mutex_);
+    auto it = node->mdns_browser_.active_resolvers.find(name);
+    if (it != node->mdns_browser_.active_resolvers.end()) {
+      node->mdns_browser_.active_resolvers.erase(it);
     }
-  } else {
-    RCLCPP_WARN(node->get_logger(), 
-                "[mDNS QUERY] ⚠️ Failed to extract SN from %s", fullname);
   }
+  
+  if (event == AVAHI_RESOLVER_FAILURE) {
+    RCLCPP_DEBUG(node->get_logger(), "[mDNS RESOLVE] ❌ Resolve failed for %s: %s", 
+                 name, avahi_strerror(avahi_client_errno(node->mdns_browser_.client)));
+    return;
+  }
+  
+  if (event != AVAHI_RESOLVER_FOUND) {
+    RCLCPP_DEBUG(node->get_logger(), "[mDNS RESOLVE] Unexpected event for %s", name);
+    return;
+  }
+  
+  // 转换为 IP 字符串
+  char address_str[AVAHI_ADDRESS_STR_MAX];
+  avahi_address_snprint(address_str, sizeof(address_str), address);
+  
+  RCLCPP_INFO(node->get_logger(), "[mDNS RESOLVE] ✅ Resolved: %s -> %s:%d", 
+              name, address_str, ntohs(port));
+  
+  // 解析 TXT 记录并添加/更新设备
+  node->parseTxtRecordFromAvahi(txt, name, address_str, ntohs(port));
 }
 
 void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen, 
@@ -354,7 +348,15 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
   
   std::string ip_address;
   
-  RCLCPP_INFO(get_logger(), "[mDNS SCAN] 🔍 Parsing TXT record for host: %s", host.c_str());
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 🔍 Parsing TXT record for host: %s, txtLen=%d", host.c_str(), txtLen);
+  
+  // ✅ 添加原始数据调试日志
+  std::ostringstream raw_data;
+  for (int i = 0; i < txtLen; i++) {
+    if (i > 0) raw_data << " ";
+    raw_data << std::hex << std::setfill('0') << std::setw(2) << (int)((const unsigned char*)txtRecord)[i];
+  }
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 🔬 Raw TXT data: %s", raw_data.str().c_str());
   
   // 尝试将主机名解析为 IPv4 地址
   struct addrinfo hints, *res;
@@ -368,10 +370,10 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
     inet_ntop(AF_INET, &(addr->sin_addr), ip_str, INET_ADDRSTRLEN);
     ip_address = std::string(ip_str);
     freeaddrinfo(res);
-    RCLCPP_INFO(get_logger(), "[mDNS SCAN] 🌐 Resolved IP: %s -> %s", host.c_str(), ip_address.c_str());
+    RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 🌐 Resolved IP: %s -> %s", host.c_str(), ip_address.c_str());
   } else {
     ip_address = host;
-    RCLCPP_WARN(get_logger(), "[mDNS SCAN] ⚠️ Failed to resolve %s, using hostname as-is", host.c_str());
+    RCLCPP_WARN(get_logger(), "[mDNS RESOLVE] ⚠️ Failed to resolve %s, using hostname as-is", host.c_str());
   }
   
   std::string sn;
@@ -385,6 +387,9 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
     std::string txt((const char*)ptr, len);
     ptr += len;
     
+    // ✅ 打印每个 TXT 字段，便于调试
+    RCLCPP_DEBUG(get_logger(), "[mDNS RESOLVE] 🔬 TXT field: '%s'", txt.c_str());
+    
     size_t pos = txt.find('=');
     if (pos != std::string::npos) {
       std::string key = txt.substr(0, pos);
@@ -392,33 +397,39 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
       
       if (key == "sn") {
         sn = value;
-        RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📝 Found SN: %s", sn.c_str());
+        RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 📝 Found SN: %s", sn.c_str());
       } else if (key == "model") {
         model = value;
-        RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📝 Found Model: %s", model.c_str());
+        RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 📝 Found Model: %s", model.c_str());
       } else if (key == "product") {
         product = value;
-        RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📝 Found Product: %s", product.c_str());
+        RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 📝 Found Product: %s", product.c_str());
       }
     }
   }
   
-  RCLCPP_INFO(get_logger(), "[mDNS SCAN] 📋 TXT parsing result: sn='%s', product='%s', model='%s'", 
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 📋 TXT parsing result: sn='%s', product='%s', model='%s'", 
               sn.c_str(), product.c_str(), model.c_str());
   
-  // 过滤：必须包含 sn 且 product 必须是 "pippet"
+  // ✅ 严格校验：必须同时包含 sn、model 和 product
   if (sn.empty()) {
-    RCLCPP_WARN(get_logger(), "[mDNS SCAN] ❌ No SN found in TXT record, skipping device");
+    RCLCPP_WARN(get_logger(), "[mDNS RESOLVE] ❌ REJECTED: No 'sn' field in TXT record (host: %s)", host.c_str());
+    return;
+  }
+  
+  if (model.empty()) {
+    RCLCPP_WARN(get_logger(), "[mDNS RESOLVE] ❌ REJECTED: No 'model' field in TXT record (host: %s, sn: %s)", 
+                host.c_str(), sn.c_str());
     return;
   }
   
   if (product != "pippet") {
-    RCLCPP_INFO(get_logger(), "[mDNS SCAN] ❌ Device product '%s' is not 'pippet', skipping (SN: %s)", 
-                product.c_str(), sn.c_str());
+    RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] ❌ REJECTED: product='%s' is not 'pippet' (host: %s, sn: %s)", 
+                product.c_str(), host.c_str(), sn.c_str());
     return;
   }
   
-  RCLCPP_INFO(get_logger(), "[mDNS SCAN] ✅ Valid COEVOS pipette found: SN=%s, Model=%s", 
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] ✅ Valid COEVOS pipette found: SN=%s, Model=%s", 
               sn.c_str(), model.c_str());
   
   PipetteDevice device;
@@ -434,14 +445,111 @@ void PipetteClientNode::parseTxtRecord(const char *txtRecord, uint16_t txtLen,
   device.last_seen.sec = now.seconds();
   device.last_seen.nanosec = now.nanoseconds();
   
+  // ✅ 初始化离线检测字段
+  device.miss_count = 0;
+  device.seen_in_current_cycle = true;
+  
   memset(&device.addr, 0, sizeof(device.addr));
   device.addr.sin_family = AF_INET;
   device.addr.sin_port = htons(device.port);
   inet_pton(AF_INET, ip_address.c_str(), &device.addr.sin_addr);
   
+  // ✅ 添加或更新设备（addDevice 会重置 miss_count）
   addDevice(sn, device);
   
-  RCLCPP_INFO(get_logger(), "[mDNS SCAN] 🎉 Device added: %s (%s) at %s:%d", 
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 🎉 Device added/updated: %s (%s) at %s:%d", 
+              sn.c_str(), model.c_str(), ip_address.c_str(), device.port);
+}
+
+void PipetteClientNode::parseTxtRecordFromAvahi(
+  AvahiStringList *txt, 
+  const std::string &sn, 
+  const std::string &ip_address, 
+  uint16_t port)
+{
+  std::string model;
+  std::string product;
+  
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 🔍 Parsing Avahi TXT record for SN: %s, IP: %s", 
+              sn.c_str(), ip_address.c_str());
+  
+  // 遍历 TXT 记录链表
+  while (txt) {
+    // AvahiStringList 的第一个字节是长度，后面是数据
+    char* str = reinterpret_cast<char*>(txt->text);
+    if (str) {
+      std::string txt_field(str);
+      RCLCPP_DEBUG(get_logger(), "[mDNS RESOLVE] 🔬 TXT field: '%s'", txt_field.c_str());
+      
+      size_t pos = txt_field.find('=');
+      if (pos != std::string::npos) {
+        std::string key = txt_field.substr(0, pos);
+        std::string value = txt_field.substr(pos + 1);
+        
+        if (key == "sn") {
+          // SN 已经在参数中提供，这里可以验证一下
+          RCLCPP_DEBUG(get_logger(), "[mDNS RESOLVE] 📝 Verified SN: %s", value.c_str());
+        } else if (key == "model") {
+          model = value;
+          RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 📝 Found Model: %s", model.c_str());
+        } else if (key == "product") {
+          product = value;
+          RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 📝 Found Product: %s", product.c_str());
+        }
+      }
+    }
+    txt = txt->next;
+  }
+  
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 📋 TXT parsing result: sn='%s', product='%s', model='%s'", 
+              sn.c_str(), product.c_str(), model.c_str());
+  
+  // ✅ 严格校验：必须同时包含 sn、model 和 product
+  if (sn.empty()) {
+    RCLCPP_WARN(get_logger(), "[mDNS RESOLVE] ❌ REJECTED: No 'sn' field in TXT record");
+    return;
+  }
+  
+  if (model.empty()) {
+    RCLCPP_WARN(get_logger(), "[mDNS RESOLVE] ❌ REJECTED: No 'model' field in TXT record (sn: %s)", sn.c_str());
+    return;
+  }
+  
+  if (product != "pippet") {
+    RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] ❌ REJECTED: product='%s' is not 'pippet' (sn: %s)", 
+                product.c_str(), sn.c_str());
+    return;
+  }
+  
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] ✅ Valid COEVOS pipette found: SN=%s, Model=%s", 
+              sn.c_str(), model.c_str());
+  
+  PipetteDevice device;
+  device.sn = sn;
+  device.model = model;
+  device.product = product;
+  device.ip_address = ip_address;
+  device.port = 10002;
+  device.available = true;
+  device.socket_fd = udp_socket_;
+  
+  auto now = this->now();
+  device.last_seen.sec = now.seconds();
+  device.last_seen.nanosec = now.nanoseconds();
+  
+  // ✅ 初始化离线检测字段
+  device.miss_count = 0;
+  device.seen_in_current_cycle = true;
+  
+  memset(&device.addr, 0, sizeof(device.addr));
+  device.addr.sin_family = AF_INET;
+  device.addr.sin_port = htons(device.port);
+  inet_pton(AF_INET, ip_address.c_str(), &device.addr.sin_addr);
+  
+  // ✅ 添加或更新设备（addDevice 会重置 miss_count）
+  addDevice(sn, device);
+  
+  RCLCPP_INFO(get_logger(), "[mDNS RESOLVE] 🎉 Device added/updated: %s (%s) at %s:%d", 
               sn.c_str(), model.c_str(), ip_address.c_str(), device.port);
 }
 
@@ -449,228 +557,84 @@ void PipetteClientNode::mdnsLoop()
 {
   RCLCPP_INFO(this->get_logger(), "mDNS event loop started");
   
-  // 初始化 last_scan_time_ 为当前时间
+  // ✅ 初始化 last_scan_time_ 为当前时间
   last_scan_time_ = this->now();
-  auto cycle_start_time = last_scan_time_;  // 记录每个扫描周期的开始时间
+  
+  int iteration_count = 0;
+  auto last_stats_time = this->now();
   
   while (mdns_browser_.running && rclcpp::ok()) {
-    fd_set readfds;
-    FD_ZERO(&readfds);
+    // ✅ 使用 Avahi simple poll 迭代，设置 100ms 超时避免阻塞
+    avahi_simple_poll_iterate(mdns_browser_.simple_poll, 100);
     
-    int browse_fd = DNSServiceRefSockFD(mdns_browser_.ref);
-    if (browse_fd >= 0) {
-      FD_SET(browse_fd, &readfds);
-    }
+    iteration_count++;
     
-    int max_fd = browse_fd;
-    std::vector<DNSServiceRef> active_resolve_refs;
-    {
-      std::lock_guard<std::mutex> lock(devices_mutex_);
-      for (DNSServiceRef resolve_ref : mdns_browser_.resolve_refs) {
-        int fd = DNSServiceRefSockFD(resolve_ref);
-        if (fd >= 0) {
-          FD_SET(fd, &readfds);
-          active_resolve_refs.push_back(resolve_ref);
-          if (fd > max_fd) max_fd = fd;
-        }
-      }
-    }
-    
-    // ✅ 加入 QueryRecord 查询的 sockets
-    std::vector<DNSServiceRef> active_query_refs;
-    {
-      std::lock_guard<std::mutex> lock(mdns_query_mutex_);
-      for (auto &query : mdns_queries_) {
-        int fd = DNSServiceRefSockFD(query.ref);
-        if (fd >= 0) {
-          FD_SET(fd, &readfds);
-          active_query_refs.push_back(query.ref);
-          if (fd > max_fd) max_fd = fd;
-        }
-      }
-    }
-    
-    if (max_fd < 0) {
-      RCLCPP_ERROR(this->get_logger(), "No valid mDNS sockets");
-      break;
-    }
-    
-    struct timeval timeout = {1, 0};
-    int ret = select(max_fd + 1, &readfds, NULL, NULL, &timeout);
-    
-    if (ret < 0) {
-      RCLCPP_ERROR(this->get_logger(), "select error: %s", strerror(errno));
-      break;
-    }
-    
-    if (ret > 0) {
-      if (browse_fd >= 0 && FD_ISSET(browse_fd, &readfds)) {
-        DNSServiceErrorType err = DNSServiceProcessResult(mdns_browser_.ref);
-        if (err != kDNSServiceErr_NoError) {
-          RCLCPP_DEBUG(this->get_logger(), "Browse DNSServiceProcessResult: %d", err);
-        }
-      }
-      
-      for (size_t i = 0; i < active_resolve_refs.size(); ++i) {
-        int fd = DNSServiceRefSockFD(active_resolve_refs[i]);
-        if (fd >= 0 && FD_ISSET(fd, &readfds)) {
-          DNSServiceErrorType err = DNSServiceProcessResult(active_resolve_refs[i]);
-          if (err != kDNSServiceErr_NoError && err != kDNSServiceErr_NoSuchRecord) {
-            RCLCPP_DEBUG(this->get_logger(), "Resolve DNSServiceProcessResult: %d", err);
-          }
-        }
-      }
-      
-      // ✅ 处理 QueryRecord 查询的响应
-      for (size_t i = 0; i < active_query_refs.size(); ++i) {
-        int fd = DNSServiceRefSockFD(active_query_refs[i]);
-        if (fd >= 0 && FD_ISSET(fd, &readfds)) {
-          DNSServiceErrorType err = DNSServiceProcessResult(active_query_refs[i]);
-          if (err != kDNSServiceErr_NoError && err != kDNSServiceErr_NoSuchRecord) {
-            RCLCPP_DEBUG(this->get_logger(), "Query DNSServiceProcessResult: %d", err);
-          }
-        }
-      }
-    }
-    
-    // 检查是否到达扫描周期结束时间
-    auto current_time = this->now();
-    auto elapsed = (current_time - cycle_start_time).seconds();
-    
-    // 添加调试日志，每次循环都输出经过的时间
-    static int loop_count = 0;
-    loop_count++;
-    if (loop_count % 10 == 0) {  // 每 10 次循环输出一次
-      RCLCPP_DEBUG(this->get_logger(), 
-                   "mdnsLoop: elapsed=%.2fs, discovery_interval=%d", 
-                   elapsed, discovery_interval_);
-    }
-    
-    // 时间异常处理
-    if (elapsed < 0 || elapsed > 2 * discovery_interval_) {
-      RCLCPP_WARN(this->get_logger(), 
-                  "Abnormal elapsed time: %.2fs, resetting scan timer", 
-                  elapsed);
-      cycle_start_time = current_time;
-    } else if (elapsed >= discovery_interval_) {
-      // 扫描周期结束，执行离线检测
+    // 每 30 秒输出一次性能统计
+    auto current_stats_time = this->now();
+    if ((current_stats_time - last_stats_time).seconds() >= 30.0) {
       RCLCPP_INFO(this->get_logger(), 
-                  "Scan cycle completed: elapsed=%.2fs, calling checkOfflineDevices()", 
+                  "📈 mDNS loop stats: %d iterations in 30s (%.2f iter/s)",
+                  iteration_count, 
+                  static_cast<double>(iteration_count) / 30.0);
+      iteration_count = 0;
+      last_stats_time = current_stats_time;
+    }
+    
+    // 检查是否到达扫描周期
+    auto current_time = this->now();
+    auto elapsed = (current_time - last_scan_time_).seconds();
+    
+    if (elapsed >= discovery_interval_) {
+      RCLCPP_INFO(this->get_logger(), 
+                  "📊 Scan cycle completed: elapsed=%.2fs", 
                   elapsed);
       
-      // ✅ 重新发起 Browse 请求来发现新设备
-      RCLCPP_INFO(this->get_logger(), "Re-browsing _tcp._tcp.local for periodic scan...");
+      // ✅ 关键修复：每个周期重新发起 Browse 查询，强制触发设备响应
+      RCLCPP_INFO(this->get_logger(), "🔄 Re-browsing _tcp._tcp.local to force device responses...");
       
-      // 清理旧的 resolve refs
-      {
-        std::lock_guard<std::mutex> lock(devices_mutex_);
-        for (DNSServiceRef resolve_ref : mdns_browser_.resolve_refs) {
-          if (resolve_ref) {
-            DNSServiceRefDeallocate(resolve_ref);
-          }
-        }
-        mdns_browser_.resolve_refs.clear();
+      // 停止旧的浏览器
+      if (mdns_browser_.service_browser) {
+        avahi_service_browser_free(mdns_browser_.service_browser);
+        mdns_browser_.service_browser = nullptr;
       }
       
-      // 释放旧的 browse ref
-      if (mdns_browser_.ref) {
-        DNSServiceRefDeallocate(mdns_browser_.ref);
-        mdns_browser_.ref = nullptr;
-      }
-      
-      // 重新发起 Browse 请求
-      DNSServiceErrorType browse_err = DNSServiceBrowse(
-        &mdns_browser_.ref,
-        0,
-        0,
-        "_tcp._tcp",
-        NULL,
-        DNSServiceBrowseReply,
+      // ✅ 重新发起 Browse 请求
+      mdns_browser_.service_browser = avahi_service_browser_new(
+        mdns_browser_.client,
+        AVAHI_IF_UNSPEC,      // 所有接口
+        AVAHI_PROTO_UNSPEC,   // 所有协议
+        "_tcp._tcp",          // 服务类型
+        NULL,                 // 域
+        static_cast<AvahiLookupFlags>(0),
+        serviceBrowserCallback,
         this
       );
       
-      if (browse_err != kDNSServiceErr_NoError) {
-        RCLCPP_DEBUG(this->get_logger(), "Periodic browse failed: %d", browse_err);
-      } else if (!mdns_browser_.ref) {
-        RCLCPP_ERROR(this->get_logger(), "Re-browse returned null ref");
+      if (!mdns_browser_.service_browser) {
+        RCLCPP_WARN(this->get_logger(), "Re-browse failed: %s", 
+                    avahi_strerror(avahi_client_errno(mdns_browser_.client)));
       } else {
-        RCLCPP_INFO(this->get_logger(), "Successfully re-browsed, waiting for responses...");
+        RCLCPP_INFO(this->get_logger(), "✅ Re-browse succeeded");
       }
       
-      // ✅ 对已知设备发送 QueryRecord 查询（异步模式）
-      // DNS-SD 官方推荐：创建查询后，将 ref 加入 select 监听，在事件循环中处理响应
+      // ✅ 增加 miss_count(连续未响应计数)
       {
-        std::lock_guard<std::mutex> lock(mdns_query_mutex_);
-        auto now = this->now();
-        
-        // 先清理超过 15 秒的旧查询
-        auto it = mdns_queries_.begin();
-        while (it != mdns_queries_.end()) {
-          auto elapsed_time = (now - it->query_time).seconds();
-          if (elapsed_time > 15) {
-            RCLCPP_DEBUG(this->get_logger(), 
-                         "Removing expired query for %s (%.2fs old)", 
-                         it->sn.c_str(), elapsed_time);
-            if (it->ref) {
-              DNSServiceRefDeallocate(it->ref);
-            }
-            it = mdns_queries_.erase(it);
-          } else {
-            ++it;
-          }
-        }
-        
-        // 只对 miss_count >= 2 的设备发送查询（给新设备 2 个周期的宽限期）
-        int query_count = 0;
-        for (auto &pair : devices_) {
-          auto &device = pair.second;
-          if (device.miss_count >= 2) {
-            DNSServiceRef query_ref = nullptr;
-            std::string fqdn = device.sn + "._tcp._tcp.local.";
-            DNSServiceErrorType query_err = DNSServiceQueryRecord(
-              &query_ref,
-              0,
-              0,
-              fqdn.c_str(),
-              kDNSServiceType_SRV,
-              kDNSServiceClass_IN,
-              DNSServiceQueryRecordReply,
-              this
-            );
-            
-            if (query_err == kDNSServiceErr_NoError && query_ref) {
-              // 将查询加入列表，稍后在 select 中监听
-              MDNSQuery query;
-              query.sn = device.sn;
-              query.ref = query_ref;
-              query.query_time = now;
-              mdns_queries_.push_back(query);
-              query_count++;
-              
-              RCLCPP_DEBUG(this->get_logger(), 
-                           "Started QueryRecord for %s (miss_count=%d)", 
-                           device.sn.c_str(), device.miss_count);
-            } else {
-              RCLCPP_DEBUG(this->get_logger(), 
-                           "Failed to send QueryRecord for %s: %d", 
-                           device.sn.c_str(), query_err);
-            }
-          }
-        }
-        
-        RCLCPP_INFO(this->get_logger(), 
-                    "Sent %d QueryRecord queries, active queries: %zu", 
-                    query_count, mdns_queries_.size());
-        
-        // 增加 miss_count
+        std::lock_guard<std::mutex> lock(devices_mutex_);
         for (auto &pair : devices_) {
           auto &device = pair.second;
           device.miss_count++;
+          
+          RCLCPP_DEBUG(this->get_logger(), 
+                       "Device %s miss_count incremented to %d", 
+                       device.sn.c_str(), device.miss_count);
         }
       }
       
+      // ✅ 执行离线检测
       checkOfflineDevices();
-      cycle_start_time = current_time;
+      
+      // 重置扫描周期计时器
+      last_scan_time_ = current_time;
     }
   }
   
@@ -836,19 +800,17 @@ void PipetteClientNode::addDevice(const std::string &sn, const PipetteDevice &de
   
   auto it = devices_.find(sn);
   if (it != devices_.end()) {
-    // 设备已存在，更新状态
+    // ✅ 设备已存在，更新状态并重置 miss_count
     it->second.last_seen = device.last_seen;
-    it->second.miss_count = 0;  // 重置缺失计数
-    it->second.seen_in_current_cycle = true;  // 标记为本周期已发现
+    it->second.ip_address = device.ip_address;  // 更新可能的 IP 变化
+    it->second.port = device.port;
+    it->second.miss_count = 0;  // ✅ 关键修复：收到设备响应，重置 miss_count
+    it->second.seen_in_current_cycle = true;
+    it->second.available = true;
     
-    if (!it->second.available) {
-      it->second.available = true;
-      RCLCPP_INFO(this->get_logger(), "Device %s (%s) back online", 
-                  sn.c_str(), it->second.ip_address.c_str());
-    }
-    
-    RCLCPP_DEBUG(this->get_logger(), "Device %s refreshed, miss_count reset to 0", 
-                 sn.c_str());
+    RCLCPP_INFO(this->get_logger(), 
+                "✅ Device %s refreshed (IP: %s), miss_count reset to 0", 
+                sn.c_str(), it->second.ip_address.c_str());
   } else {
     // 新设备，初始化离线检测字段
     PipetteDevice new_device = device;
@@ -857,7 +819,7 @@ void PipetteClientNode::addDevice(const std::string &sn, const PipetteDevice &de
     
     devices_[sn] = new_device;
     
-    RCLCPP_INFO(this->get_logger(), "New device discovered: %s (%s) at %s:%d", 
+    RCLCPP_INFO(this->get_logger(), "🆕 New device discovered: %s (%s) at %s:%d", 
                 sn.c_str(), device.model.c_str(), device.ip_address.c_str(), device.port);
   }
 }

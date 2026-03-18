@@ -19,9 +19,15 @@
 #include "pipette_client/action/mix.hpp"
 #include "pipette_client/action/eject_tip.hpp"
 
-// Apple Bonjour/mDNS compatibility layer (via Avahi)
+// Avahi native API
 extern "C" {
-#include <dns_sd.h>
+#include <avahi-client/client.h>
+#include <avahi-client/lookup.h>
+#include <avahi-common/simple-watch.h>
+#include <avahi-common/malloc.h>
+#include <avahi-common/error.h>
+#include <avahi-common/domain.h>
+#include <avahi-common/watch.h>
 }
 
 #include <memory>
@@ -65,8 +71,10 @@ struct PipetteDevice
 // mDNS 浏览器
 struct MDNSBrowser
 {
-  DNSServiceRef ref;
-  std::vector<DNSServiceRef> resolve_refs;
+  AvahiClient* client;
+  AvahiServiceBrowser* service_browser;
+  AvahiSimplePoll* simple_poll;  // ✅ 改为 AvahiSimplePoll
+  std::unordered_map<std::string, AvahiServiceResolver*> active_resolvers;  // key: service name
   std::atomic<bool> running;
 };
 
@@ -80,51 +88,37 @@ private:
   // mDNS 相关
   bool startMDNSBrowser();
   void stopMDNSBrowser();
-  static void DNSServiceBrowseReply(
-    DNSServiceRef sdRef,
-    DNSServiceFlags flags,
-    uint32_t interfaceIndex,
-    DNSServiceErrorType errorCode,
-    const char *serviceName,
-    const char *regtype,
-    const char *replyDomain,
-    void *context);
-  static void DNSServiceResolveReply(
-    DNSServiceRef sdRef,
-    DNSServiceFlags flags,
-    uint32_t interfaceIndex,
-    DNSServiceErrorType errorCode,
-    const char *fullname,
-    const char *hosttarget,
+  static void serviceBrowserCallback(
+    AvahiServiceBrowser *b,
+    AvahiIfIndex interface,
+    AvahiProtocol protocol,
+    AvahiBrowserEvent event,
+    const char *name,
+    const char *type,
+    const char *domain,
+    AvahiLookupResultFlags flags,
+    void *userdata);
+  static void serviceResolverCallback(
+    AvahiServiceResolver *r,
+    AvahiIfIndex interface,
+    AvahiProtocol protocol,
+    AvahiResolverEvent event,
+    const char *name,
+    const char *type,
+    const char *domain,
+    const char *host_name,
+    const AvahiAddress *address,
     uint16_t port,
-    uint16_t txtLen,
-    const unsigned char *txtRecord,
-    void *context);
-  static void DNSServiceQueryRecordReply(
-    DNSServiceRef sdRef,
-    DNSServiceFlags flags,
-    uint32_t interfaceIndex,
-    DNSServiceErrorType errorCode,
-    const char *fullname,
-    uint16_t rrtype,
-    uint16_t rrclass,
-    uint16_t rdlen,
-    const void *rdata,
-    uint32_t ttl,
-    void *context);
+    AvahiStringList *txt,
+    AvahiLookupResultFlags result_flags,
+    void *userdata);
   void mdnsLoop();
   
-  // ✅ mDNS 查询管理
-  struct MDNSQuery {
-    std::string sn;
-    DNSServiceRef ref;
-    rclcpp::Time query_time;
-  };
-  
-  std::vector<MDNSQuery> mdns_queries_;  // 活跃的查询列表
-  std::mutex mdns_query_mutex_;  // 查询列表互斥锁
+  // ✅ mDNS 辅助函数
   void parseTxtRecord(const char *txtRecord, uint16_t txtLen, 
                       const std::string &name, const std::string &host, uint16_t port);
+  void parseTxtRecordFromAvahi(AvahiStringList *txt, const std::string &sn, 
+                               const std::string &ip_address, uint16_t port);
   
   // UDP 相关
   bool createUDPSocket();
@@ -266,7 +260,7 @@ private:
   // 配置参数
   std::string local_port_;      // 本地 UDP 端口
   int discovery_interval_;      // 发现间隔（秒）
-  int offline_threshold_;       // 离线判定阈值（默认 30）
+  int offline_threshold_;       // 离线判定阈值（默认 3）
   rclcpp::Time last_scan_time_; // 上次扫描周期的时间戳
 };
 
